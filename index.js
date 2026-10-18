@@ -210,7 +210,6 @@ async function summary(env, ctx, st) {
     if (st.date <= today) warn.push("تاریخ امتحان گذشته یا امروزه؛ برنامهٔ مطالعه ساخته نمی‌شه.");
   } else if (st.mode === "done") {
     t = `✅ انجام کار\n${st.desc}\nتاریخ انجام: ${niceDate(st.date)}`;
-    if (st.missed) warn.push("این کار سوخته بود؛ با تأیید به «انجام‌شده» برمی‌گرده و نسخهٔ تمدیدشده‌اش کنسل می‌شه.");
   } else if (st.mode === "examdate") {
     t = `📅 تغییر تاریخ امتحان\n${st.label}\nاز: ${niceDate(st.oldDate)}\nبه: ${niceDate(st.date)}`;
     if (st.date === st.oldDate) warn.push("تاریخ تغییری نکرده.");
@@ -293,11 +292,9 @@ async function pickBook(env, ctx, chat, bookId, id) {
 const KIND = { exam: "🎓", homework: "📝", review: "🔁", preview: "👀" };
 async function showTaskList(env, chat, which, id) {
   const today = tehranToday();
+  // only live work: open (todo) rows whose deadline hasn't passed. Archived/burned/done rows are never shown.
   const q = {
-    today: ["SELECT id,kind,description FROM plan WHERE status='todo' AND plan_date<=? ORDER BY due_date, id LIMIT 15", [today], "📅 کارهای امروز"],
-    missed: [
-      "SELECT p.id,p.kind,p.description FROM plan p WHERE p.status='skipped' AND p.closed_reason='missed' AND p.due_date>=? AND NOT EXISTS (SELECT 1 FROM plan c WHERE c.extended_from=p.id AND c.status='done') ORDER BY p.due_date DESC, p.id DESC LIMIT 15",
-      [addDays(today, -7)], "⚠️ سوخته‌ها (۷ روز اخیر، تیک‌نخورده)"],
+    today: ["SELECT id,kind,description FROM plan WHERE status='todo' AND plan_date<=? AND due_date>=? ORDER BY due_date, id LIMIT 15", [today, today], "📅 کارهای امروز"],
     next: ["SELECT id,kind,description FROM plan WHERE status='todo' AND plan_date>? ORDER BY plan_date, id LIMIT 15", [today], "🔜 کارهای بعدی"]
   }[which];
   const rows = (await env.DB.prepare(q[0]).bind(...q[1]).all()).results;
@@ -306,29 +303,28 @@ async function showTaskList(env, chat, which, id) {
   return show(env, chat, id, `${q[2]}\nیکی رو بزن تا تیک بخوره:`, kb([...rows.map((r) => [btn(`${KIND[r.kind] || "•"} ${trunc(r.description, 44)}`, "t:" + r.id)]), back]));
 }
 async function pickTask(env, ctx, chat, planId, id) {
-  const p = await env.DB.prepare("SELECT p.*, b.subject FROM plan p JOIN books b ON b.id=p.book_id WHERE p.id=?").bind(planId).first();
-  if (!p) return menu(env, chat, "این کار پیدا نشد.", id);
-  if (p.status === "done") return menu(env, chat, "این کار قبلاً انجام‌شده ثبت شده.", id);
-  const missed = p.status === "skipped";
-  const st = { mode: "done", plan_id: p.id, desc: trunc(p.description, 200), missed, date: missed ? p.due_date : tehranToday() };
+  const today = tehranToday();
+  const p = await env.DB.prepare("SELECT * FROM plan WHERE id=?").bind(planId).first();
+  if (!p || p.status !== "todo" || p.due_date < today) return menu(env, chat, "این کار دیگه فعال نیست.", id);
+  const st = { mode: "done", plan_id: p.id, desc: trunc(p.description, 200), date: today };
   return renderConfirm(env, ctx, chat, st, id);
 }
 async function showExams(env, chat, id) {
-  const rows = (await env.DB.prepare("SELECT e.id,e.exam_date,e.covers,b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.status='upcoming' ORDER BY e.exam_date").all()).results;
+  const rows = (await env.DB.prepare("SELECT e.id,e.exam_date,e.covers,b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.status='upcoming' AND e.exam_date>? ORDER BY e.exam_date").bind(tehranToday()).all()).results;
   const back = [btn("🔙 منو", "menu")];
   if (!rows.length) return show(env, chat, id, "امتحان فعالی نیست.", kb([back]));
   return show(env, chat, id, "🗂 امتحان‌های پیش‌رو:", kb([...rows.map((r) => [btn(`${r.subject} — ${shortDate(r.exam_date)}`, "ex:" + r.id)]), back]));
 }
 async function showExam(env, chat, exId, id) {
-  const e = await env.DB.prepare("SELECT e.*, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.id=?").bind(exId).first();
-  if (!e) return menu(env, chat, "امتحان پیدا نشد.", id);
+  const e = await env.DB.prepare("SELECT e.*, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.id=? AND e.status='upcoming' AND e.exam_date>?").bind(exId, tehranToday()).first();
+  if (!e) return menu(env, chat, "این امتحان دیگه فعال نیست.", id);
   const pages = e.page_from != null ? `\nصفحه‌ها: ${fa(e.page_from)} تا ${fa(e.page_to)}` : "";
   return show(env, chat, id, `🎓 ${e.subject}\nمبحث: ${e.covers}${pages}\nتاریخ: ${niceDate(e.exam_date)}`,
     kb([[btn("📅 تغییر تاریخ", "exd:" + e.id)], [btn("✔️ برگزار شد", "exok:" + e.id), btn("🚫 لغو امتحان", "exc:" + e.id)], [btn("🔙 برگشت", "m:exams")]]));
 }
 async function startExamAction(env, ctx, chat, kind, exId, id) {
-  const e = await env.DB.prepare("SELECT e.*, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.id=?").bind(exId).first();
-  if (!e) return menu(env, chat, "امتحان پیدا نشد.", id);
+  const e = await env.DB.prepare("SELECT e.*, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.id=? AND e.status='upcoming' AND e.exam_date>?").bind(exId, tehranToday()).first();
+  if (!e) return menu(env, chat, "این امتحان دیگه فعال نیست.", id);
   const st = { mode: kind, exam_id: e.id, book_id: e.book_id, label: `${e.subject}: ${trunc(e.covers, 60)}`, oldDate: e.exam_date };
   if (kind === "examdate") { st.date = e.exam_date; return askField(env, ctx, chat, st, "date", id); }
   return renderConfirm(env, ctx, chat, st, id);
@@ -357,7 +353,7 @@ async function commit(env, ctx, chat, st, mid) {
       await db.prepare("INSERT INTO exams(book_id,exam_date,covers,page_from,page_to,status,notes) VALUES(?,?,?,?,?,'upcoming','telegram-bot')").bind(b.id, st.date, st.covers, st.pages?.[0] ?? null, st.pages?.[1] ?? null).run();
       note = `✅ امتحان ${b.subject} ثبت شد (${shortDate(st.date)})`;
     }
-  } else if (st.mode === "done") note = await commitDone(db, st, nowIso);
+  } else if (st.mode === "done") note = await commitDone(db, st);
   else if (st.mode === "examdate") {
     await db.prepare("UPDATE exams SET exam_date=?, notes=COALESCE(notes||' | ','')||? WHERE id=?").bind(st.date, `تاریخ از ${st.oldDate} به ${st.date} تغییر کرد (bot)`, st.exam_id).run();
     // detach old plan rows so the replanner builds a fresh study plan for the new date
@@ -374,28 +370,14 @@ async function commit(env, ctx, chat, st, mid) {
   return menu(env, chat, "برنامه تا چند دقیقهٔ دیگه خودکار به‌روز می‌شه. چیز دیگه‌ای؟");
 }
 
-async function commitDone(db, st, nowIso) {
+async function commitDone(db, st) {
   const p = await db.prepare("SELECT * FROM plan WHERE id=?").bind(st.plan_id).first();
-  if (!p) return "کار پیدا نشد.";
-  if (p.status === "done") return "این کار قبلاً انجام‌شده بود.";
-  await db.prepare("UPDATE plan SET status='done', done_at=?, closed_reason=NULL, closed_at=NULL WHERE id=?").bind(st.date, p.id).run();
-  const cancel = "status='skipped', closed_reason=?, closed_at=?";
-  if (p.status === "skipped") {
-    // a missed row was revived: cancel its extended clone, and regenerated page rows it now covers
-    await db.prepare(`UPDATE plan SET ${cancel} WHERE extended_from=? AND status='todo'`).bind("revived", nowIso, p.id).run();
-    if (p.page_from != null && (p.kind === "review" || p.kind === "preview"))
-      await db.prepare(`UPDATE plan SET ${cancel} WHERE book_id=? AND kind=? AND status='todo' AND page_from>=? AND page_to<=? AND id<>?`).bind("covered", nowIso, p.book_id, p.kind, p.page_from, p.page_to, p.id).run();
-  }
+  if (!p || p.status !== "todo") return "این کار دیگه فعال نیست.";
+  await db.prepare("UPDATE plan SET status='done', done_at=? WHERE id=?").bind(st.date, p.id).run();
   if (p.source_type === "homework" && p.source_id) {
-    // the homework itself is done once none of its plan rows (incl. extended copies) is still open
-    const ext = (await db.prepare("SELECT id FROM homework WHERE extended_from=?").bind(p.source_id).all()).results.map((r) => r.id);
-    const ids = [p.source_id, ...ext];
-    const q = ids.map(() => "?").join(",");
-    const open = await db.prepare(`SELECT count(*) n FROM plan WHERE source_type='homework' AND source_id IN (${q}) AND status='todo'`).bind(...ids).first();
-    if (!open.n) {
-      await db.prepare("UPDATE homework SET status='done', done_at=?, closed_reason=NULL, closed_at=NULL WHERE id=? AND status<>'done'").bind(st.date, p.source_id).run();
-      if (ext.length) await db.prepare(`UPDATE homework SET status='skipped', closed_reason='revived', closed_at=? WHERE id IN (${ext.map(() => "?").join(",")}) AND status='todo'`).bind(nowIso, ...ext).run();
-    }
+    // the homework itself is done once none of its plan rows is still open
+    const open = await db.prepare("SELECT count(*) n FROM plan WHERE source_type='homework' AND source_id=? AND status='todo'").bind(p.source_id).first();
+    if (!open.n) await db.prepare("UPDATE homework SET status='done', done_at=? WHERE id=? AND status='todo'").bind(st.date, p.source_id).run();
   }
   return `✅ تیک خورد: ${trunc(st.desc, 80)}`;
 }
@@ -409,7 +391,7 @@ async function onCallback(env, ctx, chat, mid, data) {
   if (cmd === "m") {
     if (["teach", "hw", "exam"].includes(arg)) return askSubject(env, ctx, chat, arg, mid);
     if (arg === "exams") return showExams(env, chat, mid);
-    if (arg === "done") return show(env, chat, mid, "✅ کدوم دسته؟", kb([[btn("📅 امروز", "dl:today"), btn("⚠️ سوخته‌ها", "dl:missed")], [btn("🔜 بعدی‌ها", "dl:next")], [btn("🔙 منو", "menu")]]));
+    if (arg === "done") return show(env, chat, mid, "✅ کدوم کارها؟", kb([[btn("📅 امروز", "dl:today"), btn("🔜 بعدی‌ها", "dl:next")], [btn("🔙 منو", "menu")]]));
   }
   if (cmd === "dl") return showTaskList(env, chat, arg, mid);
   if (cmd === "t") return pickTask(env, ctx, chat, Number(arg), mid);
