@@ -1,6 +1,11 @@
 // study-replanner-bot — Telegram bot for the study-planner D1.
 // Logs teaching / homework / exams, ticks tasks done (with a custom date), edits before confirming.
 // The study-replanner worker notices DB changes (fingerprint cron) and re-plans by itself.
+//
+// FIXES in this version:
+//  1) "آخرین ثبت" now also shows entries that have no page number (old seed rows), so the previous record is never "missing".
+//  2) Teaching a page now also marks the started lessons as taught=1 in `toc` (the website reads that column).
+//  3) Any error is now reported in Telegram instead of being swallowed silently (a failed save is no longer invisible).
 
 const DAY = 864e5;
 const ms = (d) => Date.parse(d + "T00:00:00Z");
@@ -169,6 +174,16 @@ function matchBooks(ctx, text) {
   return hits;
 }
 
+// FIX 1: last teaching record of a book. Prefers the newest record WITH a page number;
+// if the book only has records without a page (old seed rows) it falls back to the newest label.
+async function lastLog(db, bookId) {
+  const withPage = await db.prepare("SELECT up_to_page, lesson_label FROM progress_log WHERE book_id=? AND up_to_page IS NOT NULL ORDER BY report_date DESC, id DESC LIMIT 1").bind(bookId).first();
+  if (withPage) return { page: withPage.up_to_page, label: withPage.lesson_label };
+  const any = await db.prepare("SELECT lesson_label FROM progress_log WHERE book_id=? ORDER BY report_date DESC, id DESC LIMIT 1").bind(bookId).first();
+  return any ? { page: null, label: any.lesson_label } : null;
+}
+const lastLogText = (l) => (!l ? "" : l.page != null ? `\nآخرین ثبت: صفحهٔ ${fa(l.page)}` : `\nآخرین ثبت: ${l.label || "—"} (بدون شمارهٔ صفحه)`);
+
 // ───────────── modes ─────────────
 const PAST_MODES = new Set(["teach", "hw", "done", "examdone"]);
 const FIELDS = { teach: ["date", "page"], hw: ["date", "due", "text"], exam: ["date", "covers", "pages"], done: ["date"], examdate: ["date"], examdone: ["date"], examcancel: [] };
@@ -198,9 +213,9 @@ async function summary(env, ctx, st) {
   let t;
   if (st.mode === "teach") {
     const label = await tocLabel(env.DB, b.id, st.page);
-    const last = await env.DB.prepare("SELECT up_to_page FROM progress_log WHERE book_id=? AND up_to_page IS NOT NULL ORDER BY report_date DESC, id DESC LIMIT 1").bind(b.id).first();
+    const last = await lastLog(env.DB, b.id);
     t = `📚 ثبت تدریس\nدرس: ${b.subject}\nتا صفحهٔ ${fa(st.page)}${label ? ` — ${label}` : ""}\nتاریخ جلسه: ${niceDate(st.date)}`;
-    if (last && st.page < last.up_to_page) warn.push(`از آخرین ثبت (صفحهٔ ${fa(last.up_to_page)}) کمتره.`);
+    if (last && last.page != null && st.page < last.page) warn.push(`از آخرین ثبت (صفحهٔ ${fa(last.page)}) کمتره.`);
     if (!days.length) warn.push("این درس توی برنامهٔ هفتگی نیست.");
   } else if (st.mode === "hw") {
     t = `📝 ثبت تکلیف\nدرس: ${b.subject}\nتکلیف: ${st.text}\nتاریخ دادن: ${niceDate(st.date)}\nمهلت تحویل: ${st.due ? niceDate(st.due) : "بدون مهلت"}`;
@@ -282,8 +297,8 @@ async function pickBook(env, ctx, chat, bookId, id) {
   await setState(env.DB, chat, st);
   let t;
   if (st.mode === "teach") {
-    const last = await env.DB.prepare("SELECT up_to_page FROM progress_log WHERE book_id=? AND up_to_page IS NOT NULL ORDER BY report_date DESC, id DESC LIMIT 1").bind(b.id).first();
-    t = `${b.subject}\nمعلم تا چه صفحه‌ای درس داد؟ (فقط عدد)${last ? `\nآخرین ثبت: صفحهٔ ${fa(last.up_to_page)}` : ""}`;
+    const last = await lastLog(env.DB, b.id); // FIX 1
+    t = `${b.subject}\nمعلم تا چه صفحه‌ای درس داد؟ (فقط عدد)${lastLogText(last)}`;
   } else if (st.mode === "hw") t = `${b.subject}\nتکلیف چیه؟ (متن رو بنویس)`;
   else t = `${b.subject}\nامتحان از چه مبحثی؟ (متن، مثلاً «فصل ۲ و ۳»)`;
   return show(env, chat, id, t, kb([CANCEL]));
@@ -343,6 +358,8 @@ async function commit(env, ctx, chat, st, mid) {
       await db.prepare("INSERT INTO progress_log(book_id,report_date,up_to_page,lesson_label,notes) VALUES(?,?,?,?,'telegram-bot')").bind(b.id, st.date, st.page, label).run();
       note = `✅ ثبت شد: ${b.subject} تا صفحهٔ ${fa(st.page)}`;
     }
+    // FIX 2: keep the website's "taught lessons" (toc.taught) in sync with progress_log — every lesson that has started by this page
+    await db.prepare("UPDATE toc SET taught=1 WHERE book_id=? AND kind='lesson' AND start_page>0 AND start_page<=? AND taught=0").bind(b.id, st.page).run();
   } else if (st.mode === "hw") {
     await db.prepare("INSERT INTO homework(book_id,description,due_date,status,assigned_date,notes) VALUES(?,?,?,'todo',?,'telegram-bot')").bind(b.id, st.text, st.due || null, st.date).run();
     note = `✅ تکلیف ثبت شد: ${b.subject}`;
@@ -469,10 +486,17 @@ export default {
     if (url.pathname === "/health") return new Response("ok");
     if (url.pathname !== "/webhook" || request.method !== "POST") return new Response("not found", { status: 404 });
     if (!env.WEBHOOK_SECRET || request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.WEBHOOK_SECRET) return new Response("unauthorized", { status: 401 });
+    let u = null;
     try {
-      await handle(env, await request.json());
+      u = await request.json();
+      await handle(env, u);
     } catch (e) {
-      console.error("bot error", e); // always 200 so Telegram doesn't retry-storm
+      console.error("bot error", e); // always answer 200 so Telegram doesn't retry-storm
+      // FIX 3: tell the owner that something failed, instead of failing silently
+      const chat = u?.callback_query?.message?.chat?.id ?? u?.message?.chat?.id;
+      if (chat && env.OWNER_CHAT_ID && String(chat) === String(env.OWNER_CHAT_ID)) {
+        await send(env, chat, "⚠️ خطایی پیش اومد و این مورد ثبت نشد. دوباره از منو امتحان کن.", MENU).catch(() => {});
+      }
     }
     return new Response("ok");
   }
