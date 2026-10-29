@@ -7,7 +7,7 @@ async function getExam(env, exId) {
   return env.DB.prepare("SELECT e.*, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.id=? AND e.status='upcoming' AND e.exam_date>=?").bind(exId, tehranToday()).first();
 }
 
-export async function showExams(env, chat, id) {
+export async function showExams(env, chat, id, readonly = false) {
   const today = tehranToday();
   const rows = (await env.DB.prepare(
     "SELECT e.id, e.exam_date, e.covers, e.page_from, e.page_to, e.details, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.status='upcoming' AND e.exam_date>=? ORDER BY e.exam_date, e.id"
@@ -17,11 +17,12 @@ export async function showExams(env, chat, id) {
   const lines = rows.map((r, i) => {
     let s = `${fa(i + 1)}. ${r.subject} — ${shortDate(r.exam_date)} (${daysLeft(r.exam_date, today)})\n   📖 ${trunc(r.covers, 80)}`;
     s += r.page_from != null ? `\n   📄 صفحه‌های ${fa(r.page_from)} تا ${fa(r.page_to)}` : "\n   📄 صفحه‌ها: هنوز ثبت نشده";
-    if (r.details) s += `\n   📌 ${trunc(r.details, 100)}`;
+    if (!readonly && r.details) s += `\n   📌 ${trunc(r.details, 100)}`; // teacher notes are private: owner only
     return s;
   });
-  const text = `🗂 امتحان‌های پیش‌رو (${fa(rows.length)})\n\n${lines.join("\n\n")}\n\nبرای ویرایش (تاریخ، صفحه‌ها، توضیحات) روی امتحان بزن:`;
-  return show(env, chat, id, text, kb([...rows.map((r, i) => [btn(`${fa(i + 1)}. ${r.subject} — ${shortDate(r.exam_date)}`, "ex:" + r.id)]), back]));
+  const text = `🗂 امتحان‌های پیش‌رو (${fa(rows.length)})\n\n${lines.join("\n\n")}${readonly ? "" : "\n\nبرای ویرایش (تاریخ، صفحه‌ها، توضیحات) روی امتحان بزن:"}`;
+  const buttons = readonly ? [] : rows.map((r, i) => [btn(`${fa(i + 1)}. ${r.subject} — ${shortDate(r.exam_date)}`, "ex:" + r.id)]);
+  return show(env, chat, id, text, kb([...buttons, back]));
 }
 
 export async function showExam(env, chat, exId, id) {
