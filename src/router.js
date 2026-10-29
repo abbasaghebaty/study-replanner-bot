@@ -6,7 +6,7 @@ import { getState, setState, matchBooks } from "./db.js";
 import { askSubject, pickBook, renderConfirm, renderEditMenu, askField, setField, dirOf } from "./handlers/flow.js";
 import { commit } from "./handlers/commit.js";
 import { showHomework, pickHw } from "./handlers/homework.js";
-import { showExams, showExam, startExamAction } from "./handlers/exams.js";
+import { showExams, showExam, showArchivedExamsToday, startExamAction } from "./handlers/exams.js";
 
 export async function onCallback(env, ctx, chat, mid, data) {
   const db = env.DB;
@@ -17,11 +17,14 @@ export async function onCallback(env, ctx, chat, mid, data) {
     if (["teach", "hw", "exam"].includes(arg)) return askSubject(env, ctx, chat, arg, mid);
     if (arg === "hwlist") return showHomework(env, chat, mid);
     if (arg === "exams") return showExams(env, chat, mid);
+    if (arg === "archivedexams") return showArchivedExamsToday(env, chat, mid);
   }
   if (cmd === "hp") return showHomework(env, chat, mid, Number(arg));
   if (cmd === "h") return pickHw(env, ctx, chat, Number(arg), mid);
   if (cmd === "ex") return showExam(env, chat, Number(arg), mid);
+  if (cmd === "exa") return showExam(env, chat, Number(arg), mid, true);
   if (cmd === "exd") return startExamAction(env, ctx, chat, "examdate", Number(arg), mid);
+  if (cmd === "exad") return startExamAction(env, ctx, chat, "examdate", Number(arg), mid, true);
   if (cmd === "exp") return startExamAction(env, ctx, chat, "exampages", Number(arg), mid);
   if (cmd === "exn") return startExamAction(env, ctx, chat, "examnote", Number(arg), mid);
   if (cmd === "exok") return startExamAction(env, ctx, chat, "examdone", Number(arg), mid);
@@ -45,7 +48,7 @@ export async function onText(env, ctx, chat, text) {
   const db = env.DB;
   if (/^\/(start|menu|cancel)\b/.test(text)) { await setState(db, chat, null); return menu(env, chat); }
   if (/^\/(hw|homework|today)\b/.test(text)) { await setState(db, chat, null); return showHomework(env, chat); }
-  if (/^\/exams?\b/.test(text)) { await setState(db, chat, null); return showExams(env, chat); }
+  if (/^\/(exams?)\b/.test(text)) { await setState(db, chat, null); return showExams(env, chat); }
   const st = await getState(db, chat);
   if (!st) return menu(env, chat, "یکی از گزینه‌ها رو انتخاب کن 👇");
   const step = st.step;
