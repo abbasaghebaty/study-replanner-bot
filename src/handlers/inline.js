@@ -44,9 +44,7 @@ export async function onInlineQuery(env, iq) {
   const answer = (results) =>
     tg(env, "answerInlineQuery", { inline_query_id: iq.id, results, cache_time: 0, is_personal: true });
 
-  // only the owner gets results (user id == private chat id)
-  if (!env.OWNER_CHAT_ID || String(iq.from.id) !== String(env.OWNER_CHAT_ID)) return answer([]);
-
+  // open to everyone: read-only lists, teacher notes (details) stay hidden via INCLUDE_DETAILS=false
   const q = norm(iq.query || "");
   const results = [];
   if (wanted("exams", q)) {
