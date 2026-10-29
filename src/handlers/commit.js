@@ -15,7 +15,6 @@ export async function commit(env, ctx, chat, st, mid) {
       await db.prepare("INSERT INTO progress_log(book_id,report_date,up_to_page,lesson_label,notes) VALUES(?,?,?,?,'telegram-bot')").bind(b.id, st.date, st.page, label).run();
       note = `✅ ثبت شد: ${b.subject} تا صفحهٔ ${fa(st.page)}`;
     }
-    // keep the website's "taught lessons" (toc.taught) in sync — every lesson that has started by this page
     await db.prepare("UPDATE toc SET taught=1 WHERE book_id=? AND kind='lesson' AND start_page>0 AND start_page<=? AND taught=0").bind(b.id, st.page).run();
   } else if (st.mode === "hw") {
     await db.prepare("INSERT INTO homework(book_id,description,due_date,status,assigned_date,notes) VALUES(?,?,?,'todo',?,'telegram-bot')").bind(b.id, st.text, st.due || null, st.date).run();
@@ -31,8 +30,10 @@ export async function commit(env, ctx, chat, st, mid) {
     const r = await db.prepare("UPDATE homework SET status='done', done_at=? WHERE id=? AND status='todo'").bind(st.date, st.hw_id).run();
     note = r.meta?.changes ? `✅ تیک خورد: ${trunc(st.desc, 80)}` : "این تکلیف دیگه فعال نیست.";
   } else if (st.mode === "examdate") {
-    await db.prepare("UPDATE exams SET exam_date=?, notes=COALESCE(notes||' | ','')||? WHERE id=?").bind(st.date, `تاریخ از ${st.oldDate} به ${st.date} تغییر کرد (bot)`, st.exam_id).run();
-    note = `✅ تاریخ امتحان شد ${shortDate(st.date)}`;
+    // Changing the date of an exam archived today means it was postponed: reopen it.
+    await db.prepare("UPDATE exams SET exam_date=?, status=CASE WHEN status='done' THEN 'upcoming' ELSE status END, closed_at=CASE WHEN status='done' THEN NULL ELSE closed_at END, notes=COALESCE(notes||' | ','')||? WHERE id=? AND (status='upcoming' OR (status='done' AND closed_at=?))")
+      .bind(st.date, `تاریخ از ${st.oldDate} به ${st.date} تغییر کرد (bot)`, st.exam_id, today).run();
+    note = `✅ تاریخ امتحان شد ${shortDate(st.date)}${st.reopenArchived ? "\nامتحان دوباره به فهرست فعال برگشت." : ""}`;
   } else if (st.mode === "exampages") {
     await db.prepare("UPDATE exams SET page_from=?, page_to=? WHERE id=?").bind(st.pages?.[0] ?? null, st.pages?.[1] ?? null, st.exam_id).run();
     note = st.pages ? `✅ صفحه‌های امتحان شد ${fa(st.pages[0])} تا ${fa(st.pages[1])}` : "✅ صفحه‌های امتحان پاک شد.";
