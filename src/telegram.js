@@ -23,3 +23,7 @@ export const MENU = kb([
 ]);
 export const menu = (env, chat, text = "چی ثبت کنم؟", id) => show(env, chat, id, text, MENU);
 export const subjectKb = (books) => kb([...chunk(books.map((b) => btn(b.subject, "b:" + b.id)), 2), CANCEL]);
+
+// visitor (read-only) menu
+export const VISITOR_MENU = kb([[btn("📋 تکالیف", "m:hwlist"), btn("🗂 امتحان‌ها", "m:exams")]]);
+export const visitorMenu = (env, chat, text = "سلام 👋 اینجا می‌تونی تکالیف و امتحان‌های پیش‌رو رو ببینی:", id) => show(env, chat, id, text, VISITOR_MENU);
