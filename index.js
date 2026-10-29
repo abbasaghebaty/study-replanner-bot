@@ -1,11 +1,7 @@
-// study-replanner-bot — Telegram bot for the study-planner D1.
-// Logs teaching / homework / exams, ticks tasks done (with a custom date), edits before confirming.
-// The study-replanner worker notices DB changes (fingerprint cron) and re-plans by itself.
-//
-// FIXES in this version:
-//  1) "آخرین ثبت" now also shows entries that have no page number (old seed rows), so the previous record is never "missing".
-//  2) Teaching a page now also marks the started lessons as taught=1 in `toc` (the website reads that column).
-//  3) Any error is now reported in Telegram instead of being swallowed silently (a failed save is no longer invisible).
+// study-replanner-bot — Telegram bot for the study-planner D1 (simple version, no plan/replanner).
+// Features: log teaching / homework / exams, list homework, list exams,
+// tick homework done (custom date), edit exam date / pages / notes, confirm-before-save.
+// Needs D1 column: exams.details (already added).
 
 const DAY = 864e5;
 const ms = (d) => Date.parse(d + "T00:00:00Z");
@@ -28,6 +24,11 @@ const fmt = (d, opts) => {
 };
 const niceDate = (d) => (d ? `${fmt(d, { weekday: "long", day: "numeric", month: "long", year: "numeric" })} (${d})` : "—");
 const shortDate = (d) => fmt(d, { weekday: "long", day: "numeric", month: "long" });
+const daysLeft = (d, today) => {
+  const n = Math.round((ms(d) - ms(today)) / DAY);
+  return n < 0 ? `${fa(-n)} روز گذشته` : n === 0 ? "امروز" : n === 1 ? "فردا" : `${fa(n)} روز دیگه`;
+};
+const pagesText = (p) => (p ? `${fa(p[0])} تا ${fa(p[1])}` : "ندارد");
 
 // Jalali → Gregorian (jdf algorithm)
 function j2g(jy, jm, jd) {
@@ -75,7 +76,7 @@ const parsePages = (t) => {
   return !n.length ? null : n.length === 1 ? [n[0], n[0]] : [Math.min(n[0], n[1]), Math.max(n[0], n[1])];
 };
 
-// ───────────── schedule helpers (same rules as the replanner) ─────────────
+// ───────────── schedule helpers ─────────────
 function sessionDays(books, sched) {
   const own = new Map();
   for (const s of sched) {
@@ -129,8 +130,8 @@ const CANCEL = [btn("❌ لغو", "x")];
 
 const MENU = kb([
   [btn("📚 ثبت تدریس", "m:teach"), btn("📝 ثبت تکلیف", "m:hw")],
-  [btn("🎓 امتحان جدید", "m:exam"), btn("🗂 امتحان‌ها", "m:exams")],
-  [btn("✅ تیک کارها", "m:done")]
+  [btn("🎓 امتحان جدید", "m:exam")],
+  [btn("📋 تکالیف", "m:hwlist"), btn("🗂 امتحان‌ها", "m:exams")]
 ]);
 const menu = (env, chat, text = "چی ثبت کنم؟", id) => show(env, chat, id, text, MENU);
 const subjectKb = (books) => kb([...chunk(books.map((b) => btn(b.subject, "b:" + b.id)), 2), CANCEL]);
@@ -155,7 +156,7 @@ async function loadCtx(db) {
   for (const s of sched.results) if (s.book_id != null && s.subject !== "خالی") names.get(s.book_id)?.push(s.subject);
   return { books: books.results, names, sessions: sessionDays(books.results, sched.results), byId: new Map(books.results.map((b) => [b.id, b])) };
 }
-// fuzzy subject match: exact > prefix > contains. Returns the best-scoring books (1 = resolved, >1 = ask).
+// fuzzy subject match: exact > prefix > contains
 function matchBooks(ctx, text) {
   const q = norm(text);
   if (!q) return [];
@@ -174,8 +175,6 @@ function matchBooks(ctx, text) {
   return hits;
 }
 
-// FIX 1: last teaching record of a book. Prefers the newest record WITH a page number;
-// if the book only has records without a page (old seed rows) it falls back to the newest label.
 async function lastLog(db, bookId) {
   const withPage = await db.prepare("SELECT up_to_page, lesson_label FROM progress_log WHERE book_id=? AND up_to_page IS NOT NULL ORDER BY report_date DESC, id DESC LIMIT 1").bind(bookId).first();
   if (withPage) return { page: withPage.up_to_page, label: withPage.lesson_label };
@@ -186,10 +185,20 @@ const lastLogText = (l) => (!l ? "" : l.page != null ? `\nآخرین ثبت: ص�
 
 // ───────────── modes ─────────────
 const PAST_MODES = new Set(["teach", "hw", "done", "examdone"]);
-const FIELDS = { teach: ["date", "page"], hw: ["date", "due", "text"], exam: ["date", "covers", "pages"], done: ["date"], examdate: ["date"], examdone: ["date"], examcancel: [] };
+const FIELDS = {
+  teach: ["date", "page"],
+  hw: ["date", "due", "text"],
+  exam: ["date", "covers", "pages", "details"],
+  done: ["date"],
+  examdate: ["date"],
+  exampages: ["pages"],
+  examnote: ["details"],
+  examdone: ["date"],
+  examcancel: []
+};
 const dateLabel = (mode, f) =>
   f === "due" ? "⏰ مهلت تحویل" : { teach: "📅 تاریخ جلسه", hw: "📅 تاریخ دادن", exam: "📅 تاریخ امتحان", done: "📅 تاریخ انجام", examdate: "📅 تاریخ جدید", examdone: "📅 تاریخ برگزاری" }[mode];
-const fieldLabel = (mode, f) => ({ page: "📄 شمارهٔ صفحه", text: "📝 متن تکلیف", covers: "📖 مبحث", pages: "📄 صفحه‌های امتحان" }[f] || dateLabel(mode, f));
+const fieldLabel = (mode, f) => ({ page: "📄 شمارهٔ صفحه", text: "📝 متن تکلیف", covers: "📖 مبحث", pages: "📄 صفحه‌های امتحان", details: "📌 توضیحات" }[f] || dateLabel(mode, f));
 const dirOf = (mode, f) => (f === "due" || mode === "exam" || mode === "examdate" ? 1 : -1);
 
 // fill computed defaults (date from the weekly schedule, due = next class, …)
@@ -203,6 +212,12 @@ function fill(ctx, st) {
   }
   if (st.mode === "exam") st.date ??= nextSession(days, today) || addDays(today, 7);
   if (st.mode === "done" || st.mode === "examdone") st.date ??= today;
+}
+
+async function tocLabel(db, bookId, page) {
+  const r = await db.prepare("SELECT chapter, lesson, title FROM toc WHERE book_id=? AND start_page>0 AND start_page<=? ORDER BY start_page DESC, id DESC LIMIT 1").bind(bookId, page).first();
+  if (!r) return null;
+  return r.lesson != null ? `درس ${fa(r.lesson)}: ${r.title}` : `فصل ${fa(r.chapter)}: ${r.title}`;
 }
 
 async function summary(env, ctx, st) {
@@ -220,28 +235,27 @@ async function summary(env, ctx, st) {
   } else if (st.mode === "hw") {
     t = `📝 ثبت تکلیف\nدرس: ${b.subject}\nتکلیف: ${st.text}\nتاریخ دادن: ${niceDate(st.date)}\nمهلت تحویل: ${st.due ? niceDate(st.due) : "بدون مهلت"}`;
   } else if (st.mode === "exam") {
-    t = `🎓 امتحان جدید\nدرس: ${b.subject}\nمبحث: ${st.covers}\nصفحه‌ها: ${st.pages ? `${fa(st.pages[0])} تا ${fa(st.pages[1])}` : "ندارد"}\nتاریخ امتحان: ${niceDate(st.date)}`;
+    t = `🎓 امتحان جدید\nدرس: ${b.subject}\nمبحث: ${st.covers}\nصفحه‌ها: ${pagesText(st.pages)}\nتاریخ امتحان: ${niceDate(st.date)}\n📌 توضیحات: ${st.details || "ندارد"}`;
     if (!days.length) warn.push("این درس توی برنامهٔ هفتگی نیست؛ تاریخ رو دستی بزن.");
-    if (st.date <= today) warn.push("تاریخ امتحان گذشته یا امروزه؛ برنامهٔ مطالعه ساخته نمی‌شه.");
+    if (st.date < today) warn.push("تاریخ امتحان گذشته است.");
   } else if (st.mode === "done") {
-    t = `✅ انجام کار\n${st.desc}\nتاریخ انجام: ${niceDate(st.date)}`;
+    t = `✅ انجام تکلیف\n${st.desc}\nتاریخ انجام: ${niceDate(st.date)}`;
   } else if (st.mode === "examdate") {
     t = `📅 تغییر تاریخ امتحان\n${st.label}\nاز: ${niceDate(st.oldDate)}\nبه: ${niceDate(st.date)}`;
     if (st.date === st.oldDate) warn.push("تاریخ تغییری نکرده.");
-    warn.push("برنامهٔ مطالعهٔ این امتحان دوباره ساخته می‌شه.");
+  } else if (st.mode === "exampages") {
+    t = `📄 ویرایش صفحه‌های امتحان\n${st.label}\nاز: ${pagesText(st.oldPages)}\nبه: ${pagesText(st.pages)}`;
+    if (JSON.stringify(st.pages) === JSON.stringify(st.oldPages)) warn.push("صفحه‌ها تغییری نکرده.");
+  } else if (st.mode === "examnote") {
+    t = `📌 توضیحات امتحان\n${st.label}\nقبلی: ${st.oldDetails || "ندارد"}\nجدید: ${st.details || "ندارد (پاک می‌شه)"}`;
+    if ((st.details || null) === (st.oldDetails || null)) warn.push("توضیحات تغییری نکرده.");
   } else if (st.mode === "examdone") {
     t = `✔️ امتحان برگزار شد\n${st.label}\nتاریخ: ${niceDate(st.date)}`;
   } else if (st.mode === "examcancel") {
-    t = `🚫 لغو امتحان\n${st.label}\nکارهای باقی‌ماندهٔ مطالعهٔ این امتحان بسته می‌شن.`;
+    t = `🚫 لغو امتحان\n${st.label}`;
   }
   if (PAST_MODES.has(st.mode) && st.mode !== "examdone" && st.date > today) warn.push("تاریخ آینده است.");
   return t + warn.map((w) => `\n⚠️ ${w}`).join("");
-}
-
-async function tocLabel(db, bookId, page) {
-  const r = await db.prepare("SELECT chapter, lesson, title FROM toc WHERE book_id=? AND start_page>0 AND start_page<=? ORDER BY start_page DESC, id DESC LIMIT 1").bind(bookId, page).first();
-  if (!r) return null;
-  return r.lesson != null ? `درس ${fa(r.lesson)}: ${r.title}` : `فصل ${fa(r.chapter)}: ${r.title}`;
 }
 
 // confirmation screen: ✅ تأیید / ✏️ ویرایش / ❌ لغو
@@ -274,15 +288,24 @@ async function askField(env, ctx, chat, st, field, id) {
     if (field === "due") rows.push([btn("بدون مهلت", "d:none")]);
     return show(env, chat, id, `${fieldLabel(st.mode, field)} رو انتخاب کن یا بنویس\n(مثلاً ۱۴۰۵/۰۷/۲۷، امروز، دیروز، سه‌شنبه)`, kb([...rows, [btn("🔙 برگشت", "back")]]));
   }
-  const hint = { page: "شمارهٔ صفحه رو بنویس (مثلاً ۲۰).", text: "متن جدید تکلیف:", covers: "مبحث امتحان:", pages: "صفحه‌ها (مثلاً ۱-۲۰) یا «ندارد»:" }[field];
-  return show(env, chat, id, hint, kb([[btn("🔙 برگشت", "back")], CANCEL]));
+  const hint = {
+    page: "شمارهٔ صفحه رو بنویس (مثلاً ۲۰).",
+    text: "متن جدید تکلیف:",
+    covers: "مبحث امتحان:",
+    pages: "صفحه‌ها (مثلاً ۱-۲۰) یا «ندارد»:",
+    details: "توضیحات امتحان رو بنویس (مثلاً سخت‌گیری معلم، املا، گرامر و …):"
+  }[field];
+  const rows = [[btn("🔙 برگشت", "back")], CANCEL];
+  if (field === "pages") rows.unshift([btn("ندارد", "np")]);
+  if (field === "details") rows.unshift([btn("🗑 پاک کردن توضیحات", "nd")]);
+  return show(env, chat, id, hint, kb(rows));
 }
 function setField(st, field, value) {
   if (field === "due") st.dueCustom = true;
   st[field] = value;
 }
 
-// ───────────── subject / lists ─────────────
+// ───────────── subject ─────────────
 async function askSubject(env, ctx, chat, mode, id) {
   await setState(env.DB, chat, { mode, step: "subject" });
   const title = { teach: "📚 تدریس", hw: "📝 تکلیف", exam: "🎓 امتحان جدید" }[mode];
@@ -297,57 +320,94 @@ async function pickBook(env, ctx, chat, bookId, id) {
   await setState(env.DB, chat, st);
   let t;
   if (st.mode === "teach") {
-    const last = await lastLog(env.DB, b.id); // FIX 1
+    const last = await lastLog(env.DB, b.id);
     t = `${b.subject}\nمعلم تا چه صفحه‌ای درس داد؟ (فقط عدد)${lastLogText(last)}`;
   } else if (st.mode === "hw") t = `${b.subject}\nتکلیف چیه؟ (متن رو بنویس)`;
   else t = `${b.subject}\nامتحان از چه مبحثی؟ (متن، مثلاً «فصل ۲ و ۳»)`;
   return show(env, chat, id, t, kb([CANCEL]));
 }
 
-const KIND = { exam: "🎓", homework: "📝", review: "🔁", preview: "👀" };
-async function showTaskList(env, chat, which, id) {
+// ───────────── homework list ─────────────
+const HW_PAGE = 10;
+async function showHomework(env, chat, id, page = 0) {
   const today = tehranToday();
-  // only live work: open (todo) rows whose deadline hasn't passed. Archived/burned/done rows are never shown.
-  const q = {
-    today: ["SELECT id,kind,description FROM plan WHERE status='todo' AND plan_date<=? AND due_date>=? ORDER BY due_date, id LIMIT 15", [today, today], "📅 کارهای امروز"],
-    next: ["SELECT id,kind,description FROM plan WHERE status='todo' AND plan_date>? ORDER BY plan_date, id LIMIT 15", [today], "🔜 کارهای بعدی"]
-  }[which];
-  const rows = (await env.DB.prepare(q[0]).bind(...q[1]).all()).results;
-  const back = [btn("🔙 برگشت", "m:done")];
-  if (!rows.length) return show(env, chat, id, `${q[2]}\nکاری نیست 🎉`, kb([back]));
-  return show(env, chat, id, `${q[2]}\nیکی رو بزن تا تیک بخوره:`, kb([...rows.map((r) => [btn(`${KIND[r.kind] || "•"} ${trunc(r.description, 44)}`, "t:" + r.id)]), back]));
+  const where = "h.status='todo' AND (h.due_date IS NULL OR h.due_date>=?)";
+  const total = (await env.DB.prepare(`SELECT count(*) n FROM homework h WHERE ${where}`).bind(today).first()).n;
+  const back = [btn("🔙 منو", "menu")];
+  if (!total) return show(env, chat, id, "📋 تکالیف\nتکلیف بازی نداری 🎉", kb([back]));
+  const pages = Math.ceil(total / HW_PAGE);
+  page = Math.max(0, Math.min(page, pages - 1));
+  const rows = (await env.DB.prepare(
+    `SELECT h.id, h.description, h.due_date, b.subject FROM homework h JOIN books b ON b.id=h.book_id WHERE ${where} ORDER BY h.due_date IS NULL, h.due_date, h.id LIMIT ? OFFSET ?`
+  ).bind(today, HW_PAGE, page * HW_PAGE).all()).results;
+  const base = page * HW_PAGE;
+  const lines = rows.map((r, i) =>
+    `${fa(base + i + 1)}. ${r.subject}\n   ${trunc(r.description, 120)}\n   ⏰ ${r.due_date ? `${shortDate(r.due_date)} (${daysLeft(r.due_date, today)})` : "بدون مهلت"}`
+  );
+  const head = `📋 تکالیف پیش‌رو (${fa(total)})${pages > 1 ? ` — صفحهٔ ${fa(page + 1)} از ${fa(pages)}` : ""}`;
+  const text = `${head}\n\n${lines.join("\n\n")}\n\nبرای تیک‌زدن، دکمهٔ تکلیف رو بزن:`;
+  const buttons = rows.map((r, i) => [btn(`✅ ${fa(base + i + 1)}. ${r.subject}: ${trunc(r.description, 28)}`, "h:" + r.id)]);
+  const nav = [];
+  if (page > 0) nav.push(btn("⬅️ قبلی", "hp:" + (page - 1)));
+  if (page < pages - 1) nav.push(btn("بعدی ➡️", "hp:" + (page + 1)));
+  return show(env, chat, id, text, kb([...buttons, ...(nav.length ? [nav] : []), back]));
 }
-async function pickTask(env, ctx, chat, planId, id) {
-  const today = tehranToday();
-  const p = await env.DB.prepare("SELECT * FROM plan WHERE id=?").bind(planId).first();
-  if (!p || p.status !== "todo" || p.due_date < today) return menu(env, chat, "این کار دیگه فعال نیست.", id);
-  const st = { mode: "done", plan_id: p.id, desc: trunc(p.description, 200), date: today };
+async function pickHw(env, ctx, chat, hwId, id) {
+  const h = await env.DB.prepare("SELECT h.id, h.description, b.subject FROM homework h JOIN books b ON b.id=h.book_id WHERE h.id=? AND h.status='todo'").bind(hwId).first();
+  if (!h) return menu(env, chat, "این تکلیف دیگه فعال نیست.", id);
+  const st = { mode: "done", hw_id: h.id, desc: `${h.subject}: ${trunc(h.description, 200)}`, date: tehranToday() };
   return renderConfirm(env, ctx, chat, st, id);
 }
+
+// ───────────── exams ─────────────
+async function getExam(env, exId) {
+  return env.DB.prepare("SELECT e.*, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.id=? AND e.status='upcoming' AND e.exam_date>=?").bind(exId, tehranToday()).first();
+}
 async function showExams(env, chat, id) {
-  const rows = (await env.DB.prepare("SELECT e.id,e.exam_date,e.covers,b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.status='upcoming' AND e.exam_date>? ORDER BY e.exam_date").bind(tehranToday()).all()).results;
+  const today = tehranToday();
+  const rows = (await env.DB.prepare(
+    "SELECT e.id, e.exam_date, e.covers, e.page_from, e.page_to, e.details, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.status='upcoming' AND e.exam_date>=? ORDER BY e.exam_date, e.id"
+  ).bind(today).all()).results;
   const back = [btn("🔙 منو", "menu")];
-  if (!rows.length) return show(env, chat, id, "امتحان فعالی نیست.", kb([back]));
-  return show(env, chat, id, "🗂 امتحان‌های پیش‌رو:", kb([...rows.map((r) => [btn(`${r.subject} — ${shortDate(r.exam_date)}`, "ex:" + r.id)]), back]));
+  if (!rows.length) return show(env, chat, id, "🗂 امتحان فعالی نیست.", kb([back]));
+  const lines = rows.map((r, i) => {
+    let s = `${fa(i + 1)}. ${r.subject} — ${shortDate(r.exam_date)} (${daysLeft(r.exam_date, today)})\n   📖 ${trunc(r.covers, 80)}`;
+    s += r.page_from != null ? `\n   📄 صفحه‌های ${fa(r.page_from)} تا ${fa(r.page_to)}` : "\n   📄 صفحه‌ها: هنوز ثبت نشده";
+    if (r.details) s += `\n   📌 ${trunc(r.details, 100)}`;
+    return s;
+  });
+  const text = `🗂 امتحان‌های پیش‌رو (${fa(rows.length)})\n\n${lines.join("\n\n")}\n\nبرای ویرایش (تاریخ، صفحه‌ها، توضیحات) روی امتحان بزن:`;
+  return show(env, chat, id, text, kb([...rows.map((r, i) => [btn(`${fa(i + 1)}. ${r.subject} — ${shortDate(r.exam_date)}`, "ex:" + r.id)]), back]));
 }
 async function showExam(env, chat, exId, id) {
-  const e = await env.DB.prepare("SELECT e.*, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.id=? AND e.status='upcoming' AND e.exam_date>?").bind(exId, tehranToday()).first();
+  const e = await getExam(env, exId);
   if (!e) return menu(env, chat, "این امتحان دیگه فعال نیست.", id);
-  const pages = e.page_from != null ? `\nصفحه‌ها: ${fa(e.page_from)} تا ${fa(e.page_to)}` : "";
-  return show(env, chat, id, `🎓 ${e.subject}\nمبحث: ${e.covers}${pages}\nتاریخ: ${niceDate(e.exam_date)}`,
-    kb([[btn("📅 تغییر تاریخ", "exd:" + e.id)], [btn("✔️ برگزار شد", "exok:" + e.id), btn("🚫 لغو امتحان", "exc:" + e.id)], [btn("🔙 برگشت", "m:exams")]]));
+  const pages = e.page_from != null ? `${fa(e.page_from)} تا ${fa(e.page_to)}` : "هنوز ثبت نشده";
+  return show(
+    env, chat, id,
+    `🎓 ${e.subject}\nمبحث: ${e.covers}\nصفحه‌ها: ${pages}\nتاریخ: ${niceDate(e.exam_date)}\n📌 توضیحات: ${e.details || "ندارد"}`,
+    kb([
+      [btn("📅 تغییر تاریخ", "exd:" + e.id), btn("📄 ویرایش صفحه‌ها", "exp:" + e.id)],
+      [btn("📌 توضیحات", "exn:" + e.id)],
+      [btn("✔️ برگزار شد", "exok:" + e.id), btn("🚫 لغو امتحان", "exc:" + e.id)],
+      [btn("🔙 برگشت", "m:exams")]
+    ])
+  );
 }
 async function startExamAction(env, ctx, chat, kind, exId, id) {
-  const e = await env.DB.prepare("SELECT e.*, b.subject FROM exams e JOIN books b ON b.id=e.book_id WHERE e.id=? AND e.status='upcoming' AND e.exam_date>?").bind(exId, tehranToday()).first();
+  const e = await getExam(env, exId);
   if (!e) return menu(env, chat, "این امتحان دیگه فعال نیست.", id);
-  const st = { mode: kind, exam_id: e.id, book_id: e.book_id, label: `${e.subject}: ${trunc(e.covers, 60)}`, oldDate: e.exam_date };
+  const pages = e.page_from != null ? [e.page_from, e.page_to] : null;
+  const st = { mode: kind, exam_id: e.id, book_id: e.book_id, label: `${e.subject}: ${trunc(e.covers, 60)}`, oldDate: e.exam_date, oldPages: pages, oldDetails: e.details || null };
   if (kind === "examdate") { st.date = e.exam_date; return askField(env, ctx, chat, st, "date", id); }
+  if (kind === "exampages") { st.pages = pages; return askField(env, ctx, chat, st, "pages", id); }
+  if (kind === "examnote") { st.details = e.details || null; return askField(env, ctx, chat, st, "details", id); }
   return renderConfirm(env, ctx, chat, st, id);
 }
 
 // ───────────── commit ─────────────
 async function commit(env, ctx, chat, st, mid) {
-  const db = env.DB, today = tehranToday(), nowIso = new Date().toISOString();
+  const db = env.DB, today = tehranToday();
   const b = st.book_id ? ctx.byId.get(st.book_id) : null;
   let note;
   if (st.mode === "teach") {
@@ -358,7 +418,7 @@ async function commit(env, ctx, chat, st, mid) {
       await db.prepare("INSERT INTO progress_log(book_id,report_date,up_to_page,lesson_label,notes) VALUES(?,?,?,?,'telegram-bot')").bind(b.id, st.date, st.page, label).run();
       note = `✅ ثبت شد: ${b.subject} تا صفحهٔ ${fa(st.page)}`;
     }
-    // FIX 2: keep the website's "taught lessons" (toc.taught) in sync with progress_log — every lesson that has started by this page
+    // keep the website's "taught lessons" (toc.taught) in sync — every lesson that has started by this page
     await db.prepare("UPDATE toc SET taught=1 WHERE book_id=? AND kind='lesson' AND start_page>0 AND start_page<=? AND taught=0").bind(b.id, st.page).run();
   } else if (st.mode === "hw") {
     await db.prepare("INSERT INTO homework(book_id,description,due_date,status,assigned_date,notes) VALUES(?,?,?,'todo',?,'telegram-bot')").bind(b.id, st.text, st.due || null, st.date).run();
@@ -367,36 +427,29 @@ async function commit(env, ctx, chat, st, mid) {
     const dup = await db.prepare("SELECT id FROM exams WHERE book_id=? AND exam_date=? AND covers=? AND status='upcoming'").bind(b.id, st.date, st.covers).first();
     if (dup) note = "این امتحان قبلاً ثبت شده بود.";
     else {
-      await db.prepare("INSERT INTO exams(book_id,exam_date,covers,page_from,page_to,status,notes) VALUES(?,?,?,?,?,'upcoming','telegram-bot')").bind(b.id, st.date, st.covers, st.pages?.[0] ?? null, st.pages?.[1] ?? null).run();
+      await db.prepare("INSERT INTO exams(book_id,exam_date,covers,page_from,page_to,details,status,notes) VALUES(?,?,?,?,?,?,'upcoming','telegram-bot')").bind(b.id, st.date, st.covers, st.pages?.[0] ?? null, st.pages?.[1] ?? null, st.details || null).run();
       note = `✅ امتحان ${b.subject} ثبت شد (${shortDate(st.date)})`;
     }
-  } else if (st.mode === "done") note = await commitDone(db, st);
-  else if (st.mode === "examdate") {
+  } else if (st.mode === "done") {
+    const r = await db.prepare("UPDATE homework SET status='done', done_at=? WHERE id=? AND status='todo'").bind(st.date, st.hw_id).run();
+    note = r.meta?.changes ? `✅ تیک خورد: ${trunc(st.desc, 80)}` : "این تکلیف دیگه فعال نیست.";
+  } else if (st.mode === "examdate") {
     await db.prepare("UPDATE exams SET exam_date=?, notes=COALESCE(notes||' | ','')||? WHERE id=?").bind(st.date, `تاریخ از ${st.oldDate} به ${st.date} تغییر کرد (bot)`, st.exam_id).run();
-    // detach old plan rows so the replanner builds a fresh study plan for the new date
-    await db.prepare("UPDATE plan SET status=CASE WHEN status='todo' THEN 'skipped' ELSE status END, closed_reason=CASE WHEN status='todo' THEN 'rescheduled' ELSE closed_reason END, closed_at=CASE WHEN status='todo' THEN ? ELSE closed_at END, source_type='exam_old' WHERE source_type='exam' AND source_id=?").bind(nowIso, st.exam_id).run();
     note = `✅ تاریخ امتحان شد ${shortDate(st.date)}`;
+  } else if (st.mode === "exampages") {
+    await db.prepare("UPDATE exams SET page_from=?, page_to=? WHERE id=?").bind(st.pages?.[0] ?? null, st.pages?.[1] ?? null, st.exam_id).run();
+    note = st.pages ? `✅ صفحه‌های امتحان شد ${fa(st.pages[0])} تا ${fa(st.pages[1])}` : "✅ صفحه‌های امتحان پاک شد.";
+  } else if (st.mode === "examnote") {
+    await db.prepare("UPDATE exams SET details=? WHERE id=?").bind(st.details || null, st.exam_id).run();
+    note = st.details ? "✅ توضیحات امتحان ذخیره شد." : "✅ توضیحات امتحان پاک شد.";
   } else if (st.mode === "examdone" || st.mode === "examcancel") {
     const done = st.mode === "examdone";
     await db.prepare("UPDATE exams SET status=?, closed_at=? WHERE id=?").bind(done ? "done" : "cancelled", done ? st.date : today, st.exam_id).run();
-    await db.prepare("UPDATE plan SET status='skipped', closed_reason=?, closed_at=? WHERE source_type='exam' AND source_id=? AND status='todo'").bind(done ? "exam_done" : "exam_cancelled", nowIso, st.exam_id).run();
     note = done ? "✅ امتحان بسته شد." : "✅ امتحان لغو شد.";
   }
   await setState(db, chat, null);
   if (mid) await edit(env, chat, mid, note);
-  return menu(env, chat, "برنامه تا چند دقیقهٔ دیگه خودکار به‌روز می‌شه. چیز دیگه‌ای؟");
-}
-
-async function commitDone(db, st) {
-  const p = await db.prepare("SELECT * FROM plan WHERE id=?").bind(st.plan_id).first();
-  if (!p || p.status !== "todo") return "این کار دیگه فعال نیست.";
-  await db.prepare("UPDATE plan SET status='done', done_at=? WHERE id=?").bind(st.date, p.id).run();
-  if (p.source_type === "homework" && p.source_id) {
-    // the homework itself is done once none of its plan rows is still open
-    const open = await db.prepare("SELECT count(*) n FROM plan WHERE source_type='homework' AND source_id=? AND status='todo'").bind(p.source_id).first();
-    if (!open.n) await db.prepare("UPDATE homework SET status='done', done_at=? WHERE id=? AND status='todo'").bind(st.date, p.source_id).run();
-  }
-  return `✅ تیک خورد: ${trunc(st.desc, 80)}`;
+  return menu(env, chat, "چیز دیگه‌ای؟");
 }
 
 // ───────────── routing ─────────────
@@ -407,19 +460,22 @@ async function onCallback(env, ctx, chat, mid, data) {
   if (data === "menu") return menu(env, chat, "چی ثبت کنم؟", mid);
   if (cmd === "m") {
     if (["teach", "hw", "exam"].includes(arg)) return askSubject(env, ctx, chat, arg, mid);
+    if (arg === "hwlist") return showHomework(env, chat, mid);
     if (arg === "exams") return showExams(env, chat, mid);
-    if (arg === "done") return show(env, chat, mid, "✅ کدوم کارها؟", kb([[btn("📅 امروز", "dl:today"), btn("🔜 بعدی‌ها", "dl:next")], [btn("🔙 منو", "menu")]]));
   }
-  if (cmd === "dl") return showTaskList(env, chat, arg, mid);
-  if (cmd === "t") return pickTask(env, ctx, chat, Number(arg), mid);
+  if (cmd === "hp") return showHomework(env, chat, mid, Number(arg));
+  if (cmd === "h") return pickHw(env, ctx, chat, Number(arg), mid);
   if (cmd === "ex") return showExam(env, chat, Number(arg), mid);
   if (cmd === "exd") return startExamAction(env, ctx, chat, "examdate", Number(arg), mid);
+  if (cmd === "exp") return startExamAction(env, ctx, chat, "exampages", Number(arg), mid);
+  if (cmd === "exn") return startExamAction(env, ctx, chat, "examnote", Number(arg), mid);
   if (cmd === "exok") return startExamAction(env, ctx, chat, "examdone", Number(arg), mid);
   if (cmd === "exc") return startExamAction(env, ctx, chat, "examcancel", Number(arg), mid);
   if (cmd === "b") return pickBook(env, ctx, chat, Number(arg), mid);
   const st = await getState(db, chat);
   if (!st || !["confirm", "edit", "pages"].includes(st.step.split(":")[0])) return menu(env, chat, "این پیام منقضی شده؛ دوباره از منو شروع کن 👇");
   if (data === "np") { st.pages = null; return renderConfirm(env, ctx, chat, st, mid); }
+  if (data === "nd") { st.details = null; return renderConfirm(env, ctx, chat, st, mid); }
   if (data === "ok") return st.step === "confirm" ? commit(env, ctx, chat, st, mid) : renderConfirm(env, ctx, chat, st, mid);
   if (data === "e") return renderEditMenu(env, chat, st, mid);
   if (data === "back") return renderConfirm(env, ctx, chat, st, mid);
@@ -433,7 +489,8 @@ async function onCallback(env, ctx, chat, mid, data) {
 async function onText(env, ctx, chat, text) {
   const db = env.DB;
   if (/^\/(start|menu|cancel)\b/.test(text)) { await setState(db, chat, null); return menu(env, chat); }
-  if (/^\/today\b/.test(text)) { await setState(db, chat, null); return showTaskList(env, chat, "today"); }
+  if (/^\/(hw|homework|today)\b/.test(text)) { await setState(db, chat, null); return showHomework(env, chat); }
+  if (/^\/exams?\b/.test(text)) { await setState(db, chat, null); return showExams(env, chat); }
   const st = await getState(db, chat);
   if (!st) return menu(env, chat, "یکی از گزینه‌ها رو انتخاب کن 👇");
   const step = st.step;
@@ -456,6 +513,7 @@ async function onText(env, ctx, chat, text) {
   else {
     value = text;
     if (text.length < 2) return send(env, chat, "یه متن بنویس.");
+    if (field === "details" && text.length > 800) return send(env, chat, "توضیحات خیلی طولانیه؛ کوتاه‌تر بنویس (حداکثر ۸۰۰ حرف).");
   }
   setField(st, field, value);
   if (step === "covers") { st.step = "pages"; await setState(db, chat, st); return send(env, chat, "صفحه‌های امتحان؟ (مثلاً ۱-۲۰)", kb([[btn("ندارد", "np")], CANCEL])); }
@@ -492,7 +550,6 @@ export default {
       await handle(env, u);
     } catch (e) {
       console.error("bot error", e); // always answer 200 so Telegram doesn't retry-storm
-      // FIX 3: tell the owner that something failed, instead of failing silently
       const chat = u?.callback_query?.message?.chat?.id ?? u?.message?.chat?.id;
       if (chat && env.OWNER_CHAT_ID && String(chat) === String(env.OWNER_CHAT_ID)) {
         await send(env, chat, "⚠️ خطایی پیش اومد و این مورد ثبت نشد. دوباره از منو امتحان کن.", MENU).catch(() => {});
