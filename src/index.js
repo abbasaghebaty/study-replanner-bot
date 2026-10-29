@@ -1,6 +1,6 @@
 // study-replanner-bot — entry point only: webhook auth + dispatch.
 // Features live in: router.js, handlers/*.js, db.js, telegram.js, lib/*.js
-// Needs D1 column: exams.details (already added).
+// Needs D1 column: exams.details (already added). 
 // Owner (private chat with OWNER_CHAT_ID) = full access. Everyone else = read-only visitor.
 import { tg, send, MENU } from "./telegram.js";
 import { loadCtx } from "./db.js";
